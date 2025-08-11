@@ -7,13 +7,13 @@
 #include "update.h"
 #define _USE_MATH_DEFINES
 #include <math.h>
-
+#include "force.h"
 #include <cmath>
 #include <cstring>
 #include "pair.h"
 #include "memory.h"
 #include "error.h"
-
+#include <cstdlib>
 using namespace LAMMPS_NS;
 
 PairHertzianBond::PairHertzianBond(LAMMPS *lmp) : Pair(lmp) {
@@ -23,22 +23,33 @@ PairHertzianBond::PairHertzianBond(LAMMPS *lmp) : Pair(lmp) {
     dampingRatio = 0.0;
     bond_normal_strength = 5.0e6;
     bond_shear_strength  = 5.0e6;
-    binderRatio = 0.24;
+    // binderRatio = 0.24;
     one_coeff = 1;
+    cut_global = 0.0;
 }
 
 PairHertzianBond::~PairHertzianBond() {
     memory->destroy(setflag);
     memory->destroy(cut);
     memory->destroy(cutsq);
-    bondMap.clear();                    // 파괴된 결합 정리
+    bondMap.clear();                     // 결합 데이터 해제
 }
 
 void PairHertzianBond::settings(int narg, char **arg) {
-    if (narg == 1) {
-        binderRatio = atof(arg[0]);
-    } else if (narg != 0) {
+    if (narg != 2) {
         error->all(FLERR, "Illegal pair_style hertzianbond command");
+    }
+    binderRatio = atof(arg[0]);
+    cut_global  = atof(arg[1]);
+    cutforce    = cut_global;
+
+    if (allocated) {
+        for (int i = 1; i <= atom->ntypes; ++i)
+            for (int j = 1; j <= atom->ntypes; ++j)
+                if (setflag[i][j]) {
+                    cut[i][j]   = cut_global;
+                    cutsq[i][j] = cut_global * cut_global;
+                }
     }
 }
 
@@ -55,24 +66,19 @@ void PairHertzianBond::coeff(int narg, char **arg) {
         bond_shear_strength  = atof(arg[5]);
     }
     if (!allocated) allocate();
-
-    double f_b = binderRatio;
-    double maxDiameter = 0.0;
-    for (int i = 1; i <= atom->ntypes; ++i) {
-        double diam = atom->radius[i] * 2.0;
-        if (diam > maxDiameter) maxDiameter = diam;
+    if (cut_global <= 0.0) {
+        error->all(FLERR, "Pair cutoff must be positive for hertzianbond");
+    
     }
-    double cutoff = maxDiameter * (1.0 + f_b);
-    cut_global = cutoff;
-    cutforce = cutoff;
-
-    for (int i = 1; i <= atom->ntypes; ++i) {
+    
+    cutforce = cut_global;
+    
+    for (int i = 1; i <= atom->ntypes; ++i)
         for (int j = 1; j <= atom->ntypes; ++j) {
             setflag[i][j] = 1;
             cut[i][j]    = cut_global;
             cutsq[i][j]  = cut_global * cut_global;
         }
-    }
 }
 
 void PairHertzianBond::allocate() {
@@ -102,18 +108,19 @@ void PairHertzianBond::compute(int eflag, int vflag) {
     double E_eff = youngModulus / (2.0 * (1 - poissonRatio * poissonRatio));
 
     int *ilist = list->ilist;
-    int inum = list->inum;
+    int inum  = list->inum;
 
     for (int ii = 0; ii < inum; ++ii) {
         int i = ilist[ii];
         double xi = x[i][0], yi = x[i][1], zi = x[i][2];
         double ri = radius[i];
         int *jlist = list->firstneigh[i];
-        int jnum = list->numneigh[i];
+        int jnum   = list->numneigh[i];
 
         for (int jj = 0; jj < jnum; ++jj) {
-            int j = jlist[jj] & NEIGHMASK;
-            if (!newton_pair && j >= nlocal) continue;
+            int j = jlist[jj];
+            if (j >= nlocal) continue;   // 고스트 원자 무시
+            if (j <= i) continue;        // 각 쌍을 한 번만 처리
 
             double xj = x[j][0], yj = x[j][1], zj = x[j][2];
             double rj = radius[j];
@@ -201,6 +208,7 @@ void PairHertzianBond::compute(int eflag, int vflag) {
                 bond->Ft_bond[2] += dFtz;
                 double dFn = - bond->Sn * bond->A * vn_rel * update->dt;
                 bond->Fn_bond += dFn;
+
                 double wx_rel = omega[j][0] - omega[i][0];
                 double wy_rel = omega[j][1] - omega[i][1];
                 double wz_rel = omega[j][2] - omega[i][2];
@@ -238,13 +246,12 @@ void PairHertzianBond::compute(int eflag, int vflag) {
                 if (sigma_n > bond_normal_strength ||
                     tau > bond_shear_strength ||
                     r_ij > contactDist * (1.0 + binderRatio)) {
-                    bond->broken = true;
-                    bondMap.erase(key);        // 결합 제거
+                    bondMap.erase(key);   // 파괴된 결합 제거
                     bond = nullptr;
                 }
             }
 
-            if (bond && !bond->broken) {
+            if (bond) {
                 force_i[0] += bond->Fn_bond * nx;
                 force_i[1] += bond->Fn_bond * ny;
                 force_i[2] += bond->Fn_bond * nz;
@@ -274,14 +281,12 @@ void PairHertzianBond::compute(int eflag, int vflag) {
             atom->torque[i][1] += torque_i[1];
             atom->torque[i][2] += torque_i[2];
 
-            if (newton_pair || j < nlocal) {
-                atom->f[j][0] += force_j[0];
-                atom->f[j][1] += force_j[1];
-                atom->f[j][2] += force_j[2];
-                atom->torque[j][0] += torque_j[0];
-                atom->torque[j][1] += torque_j[1];
-                atom->torque[j][2] += torque_j[2];
-            }
+            atom->f[j][0] += force_j[0];
+            atom->f[j][1] += force_j[1];
+            atom->f[j][2] += force_j[2];
+            atom->torque[j][0] += torque_j[0];
+            atom->torque[j][1] += torque_j[1];
+            atom->torque[j][2] += torque_j[2];
         }
     }
 }
